@@ -5,7 +5,9 @@ import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.time.Instant;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -248,12 +250,31 @@ public class WorkingDirectory extends Sequential implements NamespaceFilesInterf
 
     @Override
     public Optional<State.Type> resolveState(RunContext runContext, Execution execution, TaskRun parentTaskRun) throws IllegalVariableEvaluationException {
+        Execution latestRun = execution.withTaskRunList(latestRunTaskRuns(execution, parentTaskRun));
+
         // subtasks run inside the Worker and each reports through its own queue message, so a failed
         // subtask must not terminate the WorkingDirectory while a sibling's terminal result is still in flight
-        boolean hasInFlightSubtask = ListUtils.emptyOnNull(execution.getTaskRunList()).stream()
+        boolean hasInFlightSubtask = latestRun.getTaskRunList().stream()
             .anyMatch(taskRun -> parentTaskRun.getId().equals(taskRun.getParentTaskRunId()) && !taskRun.getState().isTerminated());
 
-        return hasInFlightSubtask ? Optional.empty() : super.resolveState(runContext, execution, parentTaskRun);
+        return hasInFlightSubtask ? Optional.empty() : super.resolveState(runContext, latestRun, parentTaskRun);
+    }
+
+    // a resubmitted WorkingDirectory runs again from its first subtask, so the subtasks a dead worker left behind must not decide its state
+    private List<TaskRun> latestRunTaskRuns(Execution execution, TaskRun parentTaskRun) {
+        List<TaskRun> taskRuns = ListUtils.emptyOnNull(execution.getTaskRunList());
+        Optional<String> firstTaskId = this.getTasks().stream().filter(task -> !Boolean.TRUE.equals(task.getDisabled())).map(Task::getId).findFirst();
+        Optional<Instant> latestRunStart = taskRuns.stream()
+            .filter(taskRun -> parentTaskRun.getId().equals(taskRun.getParentTaskRunId()) && firstTaskId.filter(taskRun.getTaskId()::equals).isPresent())
+            .map(taskRun -> taskRun.getState().getStartDate())
+            .max(Comparator.naturalOrder());
+        if (latestRunStart.isEmpty()) {
+            return taskRuns;
+        }
+
+        return taskRuns.stream()
+            .filter(taskRun -> !parentTaskRun.getId().equals(taskRun.getParentTaskRunId()) || !taskRun.getState().getStartDate().isBefore(latestRunStart.get()))
+            .toList();
     }
 
     public WorkerTask workerTask(TaskRun parent, Task task, RunContext runContext) {
